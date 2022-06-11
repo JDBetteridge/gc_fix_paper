@@ -84,7 +84,7 @@
 \IEEEtitleabstractindextext{\begin{abstract}
 Memory managed languages such as Python and Julia are being used increasingly often on high performance computers (HPC) to drive extremely large, pre-exascale simulations.
 Generating simulation code from a high-level Python interface provides an effective mechanism for creating high performance simulations from very few lines of user code \cite{betteridge2021code}.
-Advantages of working in a managed language include the flexibility to change \jacknotes{discretisations and solvers} for better hardware utilisation, as well as being more productive for scientists and engineers.
+Advantages of working in a managed language include the flexibility to change algorithms for better hardware utilisation, as well as being more productive for scientists and engineers.
 However, one drawback is that the memory management of such a language can create havoc when attempting to clean up distributed objects.
 
 When running in parallel, it is possible for Python's garbage collector to cause a deadlock when attempting to clean up distributed C data structures that require collective destruction.
@@ -106,11 +106,13 @@ Such routines work perfectly for serial code and the inner workings are complete
 When using MPI parallelism several instances of the Python interpreter exist and the internal memory management routines are no longer synchronised.
 This can cause deadlock when deallocating objects that are defined across multiple ranks and hava a collective destruction routine.
 
-For small process counts, the
+For small process counts, the problem is not apparent, but this does not mean that the program is correct (in the sense of the Single Program Multiple Data (SPMD) paradigm).
+Even on 2 MPI ranks it is possible for deadlock to occur.
+As the number of MPI ranks used for a simulation increases, the probability that one (or more) ranks becomes desynchronised increases.
+It has been observed that for large scale simulations deadlock is the more likely outcome, wasting vast amounts of compute resources in the waiting for the task to time out.
 
 What we propose here is a method for managing the memory of distributed objects, which avoids the issues currently present when using a managed language under MPI.
 
-\todo[inline]{Something about massively parallel programs causing this to occur more frequently}
 
 %\IEEEraisesectionheading{\section{Problem}\label{sec:problem}}
 
@@ -122,6 +124,8 @@ What we propose here is a method for managing the memory of distributed objects,
 \todo[inline]{Terminology:\\
 Python or petsc4py *objects*\\
 C or PETSc "objects" are *structs*}
+
+\emph{To distinguish the memory managed by Python and the memory allocated in C, Python and petsc4py objects will be referred to as objects and PETSc ``objects'' will be referred to as structs (since this is how they are realised in the C language).}
 
 \begin{figure}
 	%\missingfigure{Object dependency graph}
@@ -143,9 +147,14 @@ C or PETSc "objects" are *structs*}
 \end{itemize}
 }
 
-To understand the problem a little must be known about how Python manages memory, when a new Python object is created memory is allocated for the object and the interpreter keeps track of the number of references to that object. If the reference count ever drops to zero, the object is unreachable and the memory can be deallocated. This is known as the reference counting garbage collector.
+To understand the problem a little must be known about how Python manages memory, when a new Python object is created memory is allocated for the object and the interpreter keeps track of the number of references to that object.
+If the reference count ever drops to zero, the object is known to be in an unreachable state and the memory can be deallocated.
+This form of memory management is referred to as the reference counting garbage collector.
 
-A purely reference counting garbage collector has some drawbacks, since it is possible for objects to hold references to one another, but neither object is accessible. \Cref{lst:cycle} demonstrates this simple case, where neither instance of class \verb`A` or \verb`B` can be reached, but the memory is not deallocated since \verb`A` holds a reference to \verb`B` and vice versa, so both objects still have a reference count of one. While this example may see a little contrived, reference cycles can readily occur, a more realistic example is given in \cref{lst:mesh}/\cref{fig:ref_cycle} constructing a mesh for a finite element problem.
+A purely reference counting garbage collector has some drawbacks, since it is possible for objects to hold cyclic references.
+This scenario is illustrated in \cref{lst:cycle} both objects hold a reference to one another, but neither object is accessible when \verb`obj` is deleted.
+In this case a purely reference counting grabage collector will not clean up the memory, since \verb`A` holds a reference to \verb`B` and vice versa and both objects still have a reference count of one.
+While this example may see a little contrived, reference cycles can readily occur, a more realistic example is given in \cref{lst:mesh}/\cref{fig:ref_cycle} constructing a mesh for a finite element problem.
 
 \lstset{language=python}
 \begin{lstlisting}[float={t}, caption={Example of simple reference cycle}, label={lst:cycle}]
@@ -180,15 +189,21 @@ x, y = mesh.get_coords()
 	\label{fig:mesh_ref_cycle}
 \end{figure}
 
-To circumvent the issue of reference cycles Python has a generational garbage collector, which runs at certain intervals to detect unreachable cycles, breaks these cycles (causing at least one reference count to go to zero) and the memory can be reclaimed by the reference counting garbage collector.
+To circumvent the issue of reference cycles Python has a cyclic garbage collector\footnote{sometimes referred to as a generational garbage collector}, which runs at certain intervals to detect unreachable cycles, breaks these cycles, which causes at least one object's reference count to go to zero.
+After this occurs the memory can be reclaimed by the reference counting garbage collector.
+Several heuristics are used to decide when the cyclic garbage collector is called, but most importantly this is not guaranteed to happen at the same time on multiple ranks of an MPI simulation.
 
-Now let us consider how memory management can breakdown in a parallel program. Consider an distributed object like a vector that is created on all ranks in a communicator and each rank holds a different range of indices. The object should be created collectively to determine which ranks hold which indices and should also be destroyed collectively to prevent the object persisting on some ranks but not others.
+Now let us consider how memory management can breakdown in a parallel program. Consider an distributed object (for instance a vector created by petsc4py) that is created on all ranks in a communicator and each rank holds a different range of indices.
+The object should be created collectively to determine which ranks hold which indices and should also be destroyed collectively to prevent the object persisting on some ranks but not others.
 
-The reference counting garbage collector should have no issues as all reference counts should be incremented and decremented implicitly concurrently if the SPMD paradigm is being followed. One could force a deadlock by destroying on one rank and not others, but then the program is no longer SPMD and no longer a valid MPI program.
+The reference counting garbage collector should have no issues as all reference counts should be incremented and decremented implicitly concurrently if the SPMD paradigm is being followed.
+One could force a deadlock by destroying on one rank and not others, but then the program is no longer SPMD and no longer a valid MPI program.
 
-However, the generational garbage collector can cause deadlock. Consider now a distributed object that contains a reference cycle like the mesh in \cref{lst:mesh}/\cref{fig:ref_cycle}. If this cycle becomes unreachable, it is up to the interpreter when exactly it calls the generational garbage collector. Even if all ranks coincidentally call the generational garbage collector at approximately the same time, there is no guarantee what order the reference cycles will be broken in!
+Now consider now a distributed object that contains a reference cycle like the mesh in \cref{lst:mesh}/\cref{fig:ref_cycle}. If this cycle becomes unreachable, it is up to the Python interpreter when exactly it calls the generational garbage collector.
+As has already been alluded to, due to the heuristics involved, invocation of the cyclic garbage collector is not deterministic and maybe called on different ranks at different times, causing deadlock.
+Even if all ranks coincidentally call the generational garbage collector at approximately the same time, there is no guarantee what order the reference cycles will be broken in!\jacknotes{we should refer to this case as something as we talk about it later: Non-deterministic cycle breaking?}
 
-This case is succinctly demonstrated in \cref{lst:issue}, where a \verb`UnitSquareMesh` object is instantiated, creating a reference cycle. Python's garbage collector is then deliberately desynchronised causing this simple MPI program to deadlock on any number of ranks greater than 1.
+This case is succinctly demonstrated in \cref{lst:issue}, where a \verb`UnitSquareMesh` Firedrake object is instantiated, creating a reference cycle which contains petsc4py objects. Python's garbage collector is then deliberately desynchronised causing this simple MPI program to deadlock on any number of ranks greater than 1.
 
 \begin{lstlisting}[float={t}, caption={Example of code that forces a deadlock}, label={lst:issue}]
 from firedrake import UnitSquareMesh
@@ -231,13 +246,20 @@ while True:
 \end{itemize}
 }
 
-The easiest way to prevent the memory management routines from causing a deadlock is to simply disable them, which may be sufficient if the application is small enough. However, this is a poor solution, with the memory management turned off the program will almost certainly be leaking memory. For a long running program creating more objects will eventually exhaust the available RAM.
+The easiest way to prevent the memory management routines from causing a deadlock is to simply disable them, which may be sufficient if the memory footprint of the executable is small enough.
+However, this is a poor solution, with the memory management turned off the program will leaking memory.
+For a long running simulation creating more objects will eventually exhaust all of the available RAM and cause the executable to terminate with an error.
 
-The solution we present performs the job of the garbage collector safely in parallel. This is done in three stages:
+The solution we present performs the job of the cyclic garbage collector safely for SPMD programs.
+This is done in three stages:
 \begin{enumerate}
-	\item \label{item:create}(Synchronous) At object instantiation the current number of objects associated with the current communicator is attained and incremented. This creation index is associated with that object for its lifetime.
-	\item \label{item:destroy}(Non-synchronous) At object destruction a reference to the object is held and added to a garbage hashmap using the creation index as the key.
-	\item \label{item:cleanup}(Synchronous) A cleanup routine is periodically called on all ranks within the communicator to deallocate the memory of any objects in the garbage hashmap that have been destroyed on all ranks, \emph{in ascending creation index order}.
+	\item \label{item:create}\textbf{Creation} (Synchronous) At object instantiation the current number of objects associated with the current communicator is attained and incremented. This creation index is associated with that object for its lifetime.
+	\item \label{item:destroy}\textbf{Delayed destruction}(Non-synchronous) At object destruction a reference to the underlying struct is held and added to a garbage hashmap using the creation index as the key. The memory is not yet freed as a reference to the struct persists.
+	\item \label{item:cleanup}\textbf{Cleanup}(Synchronous) A cleanup routine is periodically called on all ranks within the communicator to deallocate the memory occupied by the structs present in the garbage hashmap 
+	\begin{itemize}
+	\item \emph{that have been destroyed on all ranks,}
+	\item \emph{and in ascending creation index order}.
+\end{itemize}
 \end{enumerate}
 
 \cref{item:create}
@@ -268,6 +290,13 @@ The solution we present performs the job of the garbage collector safely in para
 	\item Time two regions object construction, to see effects of registering an creation index on each data structure and to see cost of calling the cleanup function
 \end{itemize}
 }
+
+It is important to establish that it is not possible to benchmark the method developed here against any previous code.
+The preceding discussion establishes any simulation involving reference cycles in petsc4py is not a truly SPMD program, unless the cyclic garbage collector is turned off.
+
+Instead the aim of this section is to establish that using the presented method does not significantly detrimental the performance of existing code.
+As a base case, we use the ``most effective workaround'' to codes that frequently hand due to parallel garbage collection issues, which is to turn off the cyclic garbage collector, but periodically and \emph{deterministically} call it at certain points during the programs execution.
+Note this is still not a truly SPMD program due to the non-deterministic cycle breaking issue.
 
 \clearpage
 \begin{figure}[htb]
