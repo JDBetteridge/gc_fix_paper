@@ -100,16 +100,16 @@ We outline an algorithm for the safe parallel destruction of distributed objects
 \IEEEPARstart{U}{se} of high-level, high productivity languages such as Python or Julia for HPC applications continues to increase. The attraction comes from the ability to create simulations with minimal programmer effort and the ability to rapidly prototype different algorithms.
 
 Managed languages liberate the programmer from manual memory management that would be required in C or FORTRAN.
-Python, for example, will take care of allocating memory as required and deallocating once all references to a block of memory are gone.
-Such routines work perfectly for serial code and the inner workings are completely transparent to the programmer.
+Python, which is the example managed language we will use throughout\footnote{although the same applies to any managed language}, will take care of allocating memory as required and deallocating once all references to a block of memory are gone.
+Such routines work well for serial code and the inner workings are completely transparent to the programmer.
 
 When using MPI parallelism several instances of the Python interpreter exist and the internal memory management routines are no longer synchronised.
 This can cause deadlock when deallocating objects that are defined across multiple ranks and have a collective destruction routine.
 
-For small process counts, the problem is not apparent, but this does not mean that the program is correct (in the sense of the Single Program Multiple Data (SPMD) paradigm).
+For small process counts, the problem is not always apparent, but this does not mean that the program is correct in the Single Program Multiple Data (SPMD) paradigm.
 Even on 2 MPI ranks it is possible for deadlock to occur.
 As the number of MPI ranks used for a simulation increases, the probability that one (or more) ranks becomes desynchronised increases.
-It has been observed that for large scale simulations deadlock is the more likely outcome, wasting vast amounts of compute resources in the waiting for the task to time out.
+We observed that for large scale simulations deadlock is the more likely outcome, wasting vast amounts of compute resources in waiting for the task to time out.
 
 What we propose here is a method for managing the memory of distributed objects, which avoids the issues currently present when using a managed language under MPI.
 
@@ -147,11 +147,12 @@ C or PETSc "objects" are *structs*}
 \end{itemize}
 }
 
-To understand the problem a little must be known about how Python manages memory, when a new Python object is created memory is allocated for the object and the interpreter keeps track of the number of references to that object.
+To fully understand the problem first it is necessary to understand how Python manages memory.
+When a new Python object is created memory is allocated for the object and the interpreter keeps track of the number of references to that object, that is the number of variables which point to the block of memory associated with the object.
 If the reference count ever drops to zero, the object is known to be in an unreachable state and the memory can be deallocated.
 This form of memory management is referred to as the reference counting garbage collector.
 
-A purely reference counting garbage collector has some drawbacks, since it is possible for objects to hold cyclic references.
+A purely reference counting garbage collector is, however, not sufficient to prevent memory from leaking, since it is possible for objects to hold cyclic references.
 This scenario is illustrated in \cref{lst:cycle} both objects hold a reference to one another, but neither object is accessible when \verb`obj` is deleted.
 In this case a purely reference counting grabage collector will not clean up the memory, since \verb`A` holds a reference to \verb`B` and vice versa and both objects still have a reference count of one.
 While this example may see a little contrived, reference cycles can readily occur, a more realistic example is given in \cref{lst:mesh}/\cref{fig:ref_cycle} constructing a mesh for a finite element problem.
@@ -247,8 +248,8 @@ while True:
 }
 
 The easiest way to prevent the memory management routines from causing a deadlock is to simply disable them, which may be sufficient if the memory footprint of the executable is small enough.
-However, this is a poor solution, with the memory management turned off the program will leaking memory.
-For a long running simulation creating more objects will eventually exhaust all of the available RAM and cause the executable to terminate with an error.
+However, this is a poor solution, with the memory management turned off the program will continuously leak memory until the program terminates and the Python interpreter exits.
+For a long running simulation creating more objects will eventually exhaust all of the available RAM and cause the executable to terminate with an out of memory error.
 
 The solution we present performs the job of the cyclic garbage collector safely for SPMD programs.
 This is done in three stages:
