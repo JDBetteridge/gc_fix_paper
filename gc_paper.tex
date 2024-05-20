@@ -104,7 +104,7 @@ Python, for example, will take care of allocating memory as required and dealloc
 Such routines work perfectly for serial code and the inner workings are completely transparent to the programmer.
 
 When using MPI parallelism several instances of the Python interpreter exist and the internal memory management routines are no longer synchronised.
-This can cause deadlock when deallocating objects that are defined across multiple ranks and hava a collective destruction routine.
+This can cause deadlock when deallocating objects that are defined across multiple ranks and have a collective destruction routine.
 
 For small process counts, the problem is not apparent, but this does not mean that the program is correct (in the sense of the Single Program Multiple Data (SPMD) paradigm).
 Even on 2 MPI ranks it is possible for deadlock to occur.
@@ -139,7 +139,7 @@ C or PETSc "objects" are *structs*}
 	\item Python is a managed language and has a two garbage collectors, reference counting and generational/cyclic (explain)
 	\item The garbage collector is called subject to a range of different conditions, but to the end user can be thought of as non-deterministic
 	\item MPI requires code to follow the Single Program Multiple Data (SPMD) programming model, where all programs execute the same instructions, but on different data
-	\item A nonm-deterministic garbage collector is at odds with the SPMD paradigm
+	\item A non-deterministic garbage collector is at odds with the SPMD paradigm
 	\item Problems occur when it comes to cleaning up parallel (distributed) objects, the GC may be called on one rank, but not others and no method to determine whether objects are still valid.
 	\item Case study is petsc4py where distributed PETSc C data structures are wrapped up in Python objects which are subject to GC
 	\item PETSc data structs and hence petsc4py objects are collectively created and destroyed which leads to issues with parallel deadlock when the GC cleans up an object on one rank but not another
